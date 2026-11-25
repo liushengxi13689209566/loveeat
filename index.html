@@ -85,6 +85,27 @@
     animation: spin .8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .thinking-head {
+    font-size: 13px;
+    color: var(--muted);
+    margin: 0 4px 8px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .thinking-text {
+    background: #292524;
+    color: #e7e5e4;
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 20px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    max-height: 180px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
   .error {
     background: #fef2f2;
     border: 1px solid #fecaca;
@@ -149,6 +170,11 @@
     <small>首次调用需要加载模型，可能要等十几秒</small>
   </section>
 
+  <section id="thinking" class="hidden">
+    <p class="thinking-head">AI 思考过程<span id="retry-note"></span></p>
+    <pre id="thinking-text" class="thinking-text"></pre>
+  </section>
+
   <section id="error" class="error hidden"></section>
 
   <section id="results" class="hidden"></section>
@@ -162,6 +188,9 @@
   const loading = document.getElementById('loading');
   const errorBox = document.getElementById('error');
   const results = document.getElementById('results');
+  const thinking = document.getElementById('thinking');
+  const thinkingText = document.getElementById('thinking-text');
+  const retryNote = document.getElementById('retry-note');
 
   // 转义 HTML，防止用户/AI 内容被当作 HTML 注入
   function escapeHTML(s) {
@@ -193,6 +222,9 @@
     if (on) {
       errorBox.classList.add('hidden');
       results.classList.add('hidden');
+      thinking.classList.add('hidden');
+      thinkingText.textContent = '';
+      retryNote.textContent = '';
     }
   }
 
@@ -219,7 +251,21 @@
     results.classList.remove('hidden');
   }
 
-  // 调用后端推荐接口
+  // 解析一段 SSE 事件文本："event: token\ndata: {...}"
+  function parseSSE(raw) {
+    let event = 'message';
+    let data = '';
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) data += line.slice(5).trim();
+    }
+    try { return { event, data: data ? JSON.parse(data) : null }; }
+    catch (e) { return { event, data: null }; }
+  }
+
+  // 调用后端流式推荐接口（SSE）：
+  // 用 fetch + ReadableStream 边收边渲染，实时展示模型生成过程，
+  // 收到 result 事件后渲染菜品卡片（原生 EventSource 只支持 GET，故不用它）。
   async function recommend() {
     const query = input.value.trim();
     if (!query) {
@@ -228,16 +274,48 @@
     }
     setLoading(true);
     try {
-      const resp = await fetch('/api/recommend', {
+      const resp = await fetch('/api/recommend/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query })
       });
-      const data = await resp.json();
-      if (!resp.ok || !data.dishes || !data.dishes.length) {
-        throw new Error(data.error || 'AI 暂时没想好，请换个说法试试');
+      if (!resp.ok || !resp.body) {
+        let msg = '后端连接失败，请确认 `go run main.go` 正在运行';
+        try { msg = (await resp.json()).error || msg; } catch (e) {}
+        throw new Error(msg);
       }
-      render(data.dishes);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buf = '';
+      let streamError = null;
+      let finished = false;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        // SSE 事件之间以空行分隔
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const { event, data } = parseSSE(buf.slice(0, idx));
+          buf = buf.slice(idx + 2);
+          if (event === 'token' && data && data.text) {
+            // 首个 token 到达：收起 loading，展示实时生成内容
+            loading.classList.add('hidden');
+            thinking.classList.remove('hidden');
+            thinkingText.textContent += data.text;
+            thinkingText.scrollTop = thinkingText.scrollHeight;
+          } else if (event === 'status' && data) {
+            retryNote.textContent = '（' + data.message + '）';
+          } else if (event === 'result' && data) {
+            finished = true;
+            render(data.dishes);
+          } else if (event === 'error' && data) {
+            streamError = data.error || 'AI 暂时没想好，请换个说法试试';
+          }
+        }
+      }
+      if (streamError) throw new Error(streamError);
+      if (!finished) throw new Error('连接中断，AI 没能给出完整推荐，请重试');
     } catch (e) {
       showError(e.name === 'TypeError'
         ? '无法连接后端服务，请确认 `go run main.go` 正在运行'

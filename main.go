@@ -6,7 +6,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,15 +56,6 @@ var dishes = []Dish{
 	{Name: "酸辣汤", Tastes: []string{"酸", "辣"}, Ingredients: []string{"豆腐", "木耳", "鸡蛋", "胡椒粉"}, Category: "汤"},
 	{Name: "苦瓜排骨汤", Tastes: []string{"苦"}, Ingredients: []string{"苦瓜", "排骨"}, Category: "汤"},
 }
-
-// dishIndex “菜名 -> 菜品”索引，用于校验 AI 返回的菜名是否真实存在（防止模型编造）
-var dishIndex = func() map[string]Dish {
-	m := make(map[string]Dish, len(dishes))
-	for _, d := range dishes {
-		m[d.Name] = d
-	}
-	return m
-}()
 
 // ---------------- 配置（可用环境变量覆盖，便于调试） ----------------
 
@@ -133,15 +126,81 @@ func callOllama(prompt string) (string, error) {
 	return out.Response, nil
 }
 
+// ollamaStreamChunk 是 Ollama 流式响应中一行 NDJSON 的关键字段。
+// stream=true 时 Ollama 按行返回生成进度，每行一个 JSON 对象，
+// response 字段是本次新增的文本片段，最后一行 done=true。
+type ollamaStreamChunk struct {
+	Response string `json:"response"`
+	Done     bool   `json:"done"`
+}
+
+// callOllamaStream 以流式方式调用 Ollama /api/generate（stream=true），
+// 每收到一段增量文本就通过 onToken 回调上抛（供 SSE 实时转发给前端），
+// 函数返回拼接后的完整输出文本。
+// ctx 绑定到对 Ollama 的请求上：客户端（浏览器）断开连接时会同步中断生成。
+func callOllamaStream(ctx context.Context, prompt string, onToken func(string)) (string, error) {
+	payload, err := json.Marshal(map[string]any{
+		"model":   ollamaModel,
+		"prompt":  prompt,
+		"stream":  true, // 流式：Ollama 逐段返回生成内容
+		"options": map[string]any{"temperature": 0.3},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ollamaURL+"/api/generate", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ollamaClient.Do(req)
+	if err != nil {
+		return "", &ollamaError{msg: fmt.Sprintf(
+			"无法连接本地 Ollama（%s）：请确认 Ollama 正在运行，且已执行 `ollama pull %s` 拉取模型",
+			ollamaURL, ollamaModel)}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return "", &ollamaError{msg: fmt.Sprintf("Ollama 返回异常状态码 %d：%s",
+			resp.StatusCode, strings.TrimSpace(string(body)))}
+	}
+
+	var full strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20) // 单行 JSON 可能较长，放大扫描缓冲上限
+	for scanner.Scan() {
+		var chunk ollamaStreamChunk
+		if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+			continue // 忽略空行等无法解析的杂项行
+		}
+		if chunk.Response != "" {
+			full.WriteString(chunk.Response)
+			onToken(chunk.Response)
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return full.String(), err
+	}
+	return full.String(), nil
+}
+
 // ---------------- Prompt 构造 ----------------
 
-// buildPrompt 按固定模板构造提示词：菜品库 JSON + 用户需求 + 严格的输出格式要求。
+// buildPrompt 按固定模板构造提示词：（忌口过滤后的）菜品库 JSON + 用户需求 + 严格的输出格式要求。
 // 关键点：
 //   - 菜品库序列化为 JSON 后整体拼入，模型据此“查库”而不是凭空编菜名；
-//   - 明确要求“不要XX”要对照 ingredients 字段过滤；
+//   - 明确要求“不要XX”要对照 ingredients 字段过滤（提示词层保险，
+//     硬约束另由后端忌口预过滤兜底保证）；
 //   - 强制只返回纯 JSON 数组，便于后端解析。
-func buildPrompt(query string, count int) string {
-	menuJSON, _ := json.Marshal(dishes) // 序列化菜品库（紧凑 JSON）
+func buildPrompt(menu []Dish, query string, count int) string {
+	menuJSON, _ := json.Marshal(menu) // 序列化菜品库（紧凑 JSON）
 	return fmt.Sprintf(`你是一个智能点餐助手。这里有一份菜品库：%s。
 用户的需求是："%s"。
 请从菜品库中挑选出符合用户要求的菜品。特别注意：如果用户说"不要XX"，一定要检查菜品的 ingredients 中是否包含该成分。
@@ -228,6 +287,66 @@ func chineseToInt(s string) int {
 	return 0
 }
 
+// ---------------- 忌口解析 ----------------
+
+// forbiddenRe 匹配“不要XX / 不吃XX / 别吃XX / 忌口XX”等忌口表达，捕获忌口内容（食材或口味）。
+// 捕获组使用 [\p{Han}0-9a-zA-Z]+，在标点/空格处自然截断，
+// 如“不要猪肉，来两道菜”捕获“猪肉”、“不要辣的”捕获“辣的”（后面再去掉“的”）。
+var forbiddenRe = regexp.MustCompile(`(?:不要|不吃|别吃|别放|别加|忌口|忌|没有)([\p{Han}0-9a-zA-Z]+)`)
+
+// parseForbidden 从用户输入中提取所有忌口关键词（如“不要猪肉”->“猪肉”）。
+// 后端据此直接过滤菜品库，作为小模型可能无视提示词约束时的兜底保障。
+func parseForbidden(query string) []string {
+	matches := forbiddenRe.FindAllStringSubmatch(query, -1)
+	var out []string
+	for _, m := range matches {
+		w := strings.TrimSuffix(m[1], "的") // “不要辣的”->“辣”
+		if w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// filterByForbidden 按忌口关键词过滤菜品，命中任一规则即剔除：
+//  1. 忌口词与菜名互相包含（“不要红烧肉”命中“红烧肉”）；
+//  2. 忌口词与任一食材互相包含（“猪肉”命中“猪肉末”/“猪五花肉”，双向包含可兼容
+//     用户写“不要猪肉末”而库里写“猪肉”的情况）；
+//  3. 忌口词本身是口味标签（“不要辣”排除所有辣味菜）。
+func filterByForbidden(menu []Dish, forbidden []string) []Dish {
+	out := make([]Dish, 0, len(menu))
+	for _, d := range menu {
+		banned := false
+		for _, f := range forbidden {
+			if strings.Contains(d.Name, f) {
+				banned = true
+				break
+			}
+			for _, ing := range d.Ingredients {
+				if strings.Contains(ing, f) || strings.Contains(f, ing) {
+					banned = true
+					break
+				}
+			}
+			if !banned {
+				for _, t := range d.Tastes {
+					if t == f {
+						banned = true
+						break
+					}
+				}
+			}
+			if banned {
+				break
+			}
+		}
+		if !banned {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // ---------------- 模型输出解析 ----------------
 
 // extractJSONArray 从模型输出文本中提取 JSON 字符串数组。
@@ -246,22 +365,29 @@ func extractJSONArray(text string) ([]string, error) {
 	return names, nil
 }
 
-// selectDishes 解析模型输出并映射回菜品库：
+// selectDishes 解析模型输出并映射回（忌口过滤后的）可选菜单：
 //  1. 提取 JSON 数组；
-//  2. 剔除菜品库中不存在的菜名（防止模型编造/幻觉）；
+//  2. 剔除可选菜单中不存在的菜名（模型编造，或已被忌口过滤）；
 //  3. 按用户要的数量截断。
-func selectDishes(text string, count int) ([]Dish, error) {
+func selectDishes(text string, count int, menu []Dish) ([]Dish, error) {
 	names, err := extractJSONArray(text)
 	if err != nil {
 		return nil, err
 	}
 	log.Printf("模型返回菜名: %q", names)
+
+	// 可选菜单索引：模型返回的菜名必须来自这里（防止编造/绕过忌口过滤）
+	allowed := make(map[string]Dish, len(menu))
+	for _, d := range menu {
+		allowed[d.Name] = d
+	}
+
 	seen := make(map[string]bool, len(names))
 	var selected []Dish
 	var unknownNames []string
 	for _, n := range names {
 		n = strings.TrimSpace(n)
-		if d, ok := dishIndex[n]; ok && !seen[n] {
+		if d, ok := allowed[n]; ok && !seen[n] {
 			seen[n] = true
 			selected = append(selected, d)
 		} else if !ok {
@@ -269,15 +395,58 @@ func selectDishes(text string, count int) ([]Dish, error) {
 		}
 	}
 	if len(unknownNames) > 0 {
-		log.Printf("已剔除菜品库中不存在的菜名: %q", unknownNames)
+		log.Printf("已剔除不在可选菜单中的菜名: %q", unknownNames)
 	}
 	if len(selected) == 0 {
-		return nil, fmt.Errorf("模型返回的菜名均不在菜品库中: %v", names)
+		return nil, fmt.Errorf("模型返回的菜名均不在可选菜单中: %v", names)
 	}
 	if len(selected) > count {
 		selected = selected[:count]
 	}
 	return selected, nil
+}
+
+// ---------------- 请求准备（普通/流式接口共用） ----------------
+
+// recommendPlan 一次推荐请求的准备工作产物
+type recommendPlan struct {
+	Count     int      // 用户要几道菜
+	Menu      []Dish   // 忌口过滤后的可选菜品
+	Prompt    string   // 构造好的完整提示词
+	Forbidden []string // 识别到的忌口关键词
+}
+
+// prepareRecommend 解析数量 -> 忌口预过滤 -> 构造 Prompt。
+// 忌口过滤后菜品库为空时返回带友好提示的 error。
+func prepareRecommend(query string) (*recommendPlan, error) {
+	count := parseCount(query)
+
+	// 忌口预过滤（后端兜底）：小模型经常无视提示词里的“不要XX”约束，
+	// 因此在把菜品库交给模型之前，先按用户输入确定的忌口食材/口味过滤菜品库，
+	// 被禁的菜根本不会出现在模型的可选范围内，保证约束一定生效。
+	menu := dishes
+	forbidden := parseForbidden(query)
+	if len(forbidden) > 0 {
+		menu = filterByForbidden(dishes, forbidden)
+		log.Printf("识别到忌口: %q，可选菜品从 %d 道过滤为 %d 道", forbidden, len(dishes), len(menu))
+	}
+	if len(menu) == 0 {
+		log.Printf("忌口 %v 过滤后菜品库为空", forbidden)
+		return nil, fmt.Errorf("菜品库中没有符合忌口 %v 的菜品，换个忌口试试？", forbidden)
+	}
+
+	return &recommendPlan{
+		Count:     count,
+		Menu:      menu,
+		Prompt:    buildPrompt(menu, query, count),
+		Forbidden: forbidden,
+	}, nil
+}
+
+// logPrompt 打印完整模型输入日志（调试用，普通/流式接口共用）
+func logPrompt(prompt string) {
+	log.Printf("========== 模型输入 [模型: %s，%d 字符] ==========\n%s\n========== 模型输入结束 ==========",
+		ollamaModel, len([]rune(prompt)), prompt)
 }
 
 // ---------------- HTTP 处理 ----------------
@@ -317,20 +486,22 @@ func recommendHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	query := strings.TrimSpace(req.Query)
 
-	// 从需求中解析用户要几道菜（如“来两道”-> 2），未提及则默认 3 道
-	count := parseCount(query)
-	prompt := buildPrompt(query, count)
-	log.Printf("收到需求: %q（需要 %d 道菜）", query, count)
+	// 解析数量、忌口过滤、构造 Prompt（流式接口复用同一套准备逻辑）
+	plan, err := prepareRecommend(query)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
+	log.Printf("收到需求: %q（需要 %d 道菜）", query, plan.Count)
 	// 打印完整模型输入（Prompt），便于调试 Prompt 效果、排查“AI 不听话”的问题
-	log.Printf("========== 模型输入 [模型: %s，%d 字符] ==========\n%s\n========== 模型输入结束 ==========",
-		ollamaModel, len([]rune(prompt)), prompt)
+	logPrompt(plan.Prompt)
 
 	// 调用 Ollama。小模型输出偶发不稳定（夹带解释文字、编造菜名），解析失败自动重试一次；
 	// 连接类错误（Ollama 没启动等）重试无意义，立即结束。
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
 		start := time.Now()
-		text, err := callOllama(prompt)
+		text, err := callOllama(plan.Prompt)
 		if err != nil {
 			lastErr = err
 			log.Printf("Ollama 调用失败（耗时 %v）: %v", time.Since(start), err)
@@ -339,7 +510,7 @@ func recommendHandler(w http.ResponseWriter, r *http.Request) {
 		// 打印模型原始输出（不截断），便于定位解析失败的具体原因
 		log.Printf("========== 模型输出 [耗时 %v] ==========\n%s\n========== 模型输出结束 ==========",
 			time.Since(start), text)
-		selected, err := selectDishes(text, count)
+		selected, err := selectDishes(text, plan.Count, plan.Menu)
 		if err == nil {
 			log.Printf("推荐成功: %v", dishNames(selected))
 			writeJSON(w, http.StatusOK, recommendResponse{Dishes: selected})
@@ -360,6 +531,94 @@ func recommendHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusBadGateway, errorResponse{Error: "AI 暂时没想好，请换个说法试试"})
 }
 
+// ---------------- SSE 流式推荐 ----------------
+
+// writeSSE 向客户端写出一条 SSE 事件并立即推送。
+// 协议格式：event: <事件名>\ndata: <JSON>\n\n（JSON 永远压成单行，不破坏 SSE 分帧）
+func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, payload any) {
+	data, _ := json.Marshal(payload)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	flusher.Flush()
+}
+
+// recommendStreamHandler 流式推荐接口（SSE），事件约定：
+//   - token  —— 模型增量输出片段 {"text":"..."}，前端实时展示“AI 思考过程”
+//   - status —— 过程状态 {"message":"..."}（如解析失败自动重试）
+//   - result —— 最终推荐菜品，结构与普通接口一致 {"dishes":[...]}
+//   - error  —— 失败信息 {"error":"..."}
+//
+// 前端用 fetch + ReadableStream 读取（原生 EventSource 只支持 GET，无法带 POST body）。
+func recommendStreamHandler(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "当前环境不支持流式响应"})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "请使用 POST 请求"})
+		return
+	}
+
+	// SSE 必需的响应头
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	var req recommendRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+		writeSSE(w, flusher, "error", errorResponse{Error: "请输入你的用餐需求，例如：想吃点辣的，不要猪肉，来两道菜"})
+		return
+	}
+	query := strings.TrimSpace(req.Query)
+
+	plan, err := prepareRecommend(query)
+	if err != nil {
+		writeSSE(w, flusher, "error", errorResponse{Error: err.Error()})
+		return
+	}
+	log.Printf("收到需求(流式): %q（需要 %d 道菜）", query, plan.Count)
+	logPrompt(plan.Prompt)
+
+	// 与普通接口相同的重试策略：解析失败自动重试一次。
+	// 每次尝试的模型输出都实时推给前端，重试前用 status 事件告知。
+	for attempt := 1; attempt <= 2; attempt++ {
+		if attempt > 1 {
+			writeSSE(w, flusher, "status", map[string]string{"message": "输出解析失败，自动重试中…"})
+		}
+		start := time.Now()
+		text, err := callOllamaStream(r.Context(), plan.Prompt, func(tok string) {
+			writeSSE(w, flusher, "token", map[string]string{"text": tok})
+		})
+		if err != nil {
+			// 客户端主动断开（如关闭页面）时静默结束
+			if r.Context().Err() != nil {
+				log.Printf("客户端断开连接，停止本次流式推荐")
+				return
+			}
+			log.Printf("Ollama 调用失败（耗时 %v）: %v", time.Since(start), err)
+			msg := "AI 暂时没想好，请换个说法试试"
+			var ollErr *ollamaError
+			if errors.As(err, &ollErr) {
+				msg = ollErr.msg
+			}
+			writeSSE(w, flusher, "error", errorResponse{Error: msg})
+			return
+		}
+		// 打印模型原始输出（不截断），便于定位解析失败的具体原因
+		log.Printf("========== 模型输出 [耗时 %v] ==========\n%s\n========== 模型输出结束 ==========",
+			time.Since(start), text)
+
+		selected, err := selectDishes(text, plan.Count, plan.Menu)
+		if err == nil {
+			log.Printf("推荐成功: %v", dishNames(selected))
+			writeSSE(w, flusher, "result", recommendResponse{Dishes: selected})
+			return
+		}
+		log.Printf("第 %d 次解析失败: %v", attempt, err)
+	}
+	log.Printf("推荐失败: 两次解析均失败")
+	writeSSE(w, flusher, "error", errorResponse{Error: "AI 暂时没想好，请换个说法试试"})
+}
+
 // writeJSON 统一的 JSON 响应输出
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -378,8 +637,9 @@ func dishNames(ds []Dish) []string {
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", indexHandler)                  // GET / 返回前端页面
-	mux.HandleFunc("/api/recommend", recommendHandler) // POST 推荐接口
+	mux.HandleFunc("/", indexHandler)                               // GET / 返回前端页面
+	mux.HandleFunc("/api/recommend", recommendHandler)              // POST 推荐接口（一次性返回）
+	mux.HandleFunc("/api/recommend/stream", recommendStreamHandler) // POST 流式推荐接口（SSE）
 
 	log.Printf("智能选餐已启动，访问 http://localhost%s （Ollama: %s，模型: %s）", listenAddr, ollamaURL, ollamaModel)
 	if err := http.ListenAndServe(listenAddr, mux); err != nil {

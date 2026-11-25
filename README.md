@@ -37,7 +37,7 @@ go run main.go
 ## 接口
 
 - `GET /`：前端页面
-- `POST /api/recommend`：
+- `POST /api/recommend`（一次性返回）：
 
   ```json
   // 请求
@@ -45,6 +45,12 @@ go run main.go
   // 响应
   {"dishes": [{"name": "水煮鱼", "tastes": ["辣"], "ingredients": ["鱼", "豆芽", "豆瓣酱", "干辣椒"], "category": "荤菜"}]}
   ```
+
+- `POST /api/recommend/stream`（SSE 流式，前端默认使用）：逐 token 实时推送模型生成过程，事件约定
+  - `token`：`{"text": "..."}` 模型增量输出片段
+  - `status`：`{"message": "..."}` 过程状态（如解析失败自动重试）
+  - `result`：`{"dishes": [...]}` 最终推荐菜品（与普通接口一致）
+  - `error`：`{"error": "..."}` 失败信息
 
 ## 常见问题
 
@@ -55,5 +61,11 @@ go run main.go
 
 ## 文件说明
 
-- `main.go`：后端（菜品库、Prompt 构造、Ollama 调用、数量解析、JSON 提取与校验、路由）
+- `main.go`：后端（菜品库、忌口解析与预过滤、Prompt 构造、Ollama 调用、数量解析、JSON 提取与校验、路由）
 - `index.html`：前端单页（原生 JS/CSS，内嵌于后端同目录，由 `GET /` 直接返回）
+
+## 实现说明
+
+- **忌口双重保障**：后端会先解析“不要XX / 不吃XX”等表达并直接过滤菜品库（被禁食材不会进入模型的可选范围），提示词中同时仍要求模型检查 ingredients。小模型偶发无视提示词约束，预过滤保证硬约束一定生效。
+- **流式输出**：后端以 `stream=true` 调用 Ollama，把模型逐段生成的内容经 SSE 实时转发给前端（`fetch` + `ReadableStream` 读取），页面上的“AI 思考过程”框会实时打印生成内容，生成完毕后渲染菜品卡片；模型输出解析失败时仍会自动重试一次。
+- **调试日志**：每次请求打印完整模型输入（Prompt）、模型原始输出（含耗时）、模型返回菜名、被剔除菜名、忌口识别与过滤结果，直接看 `go run main.go` 的终端输出。
