@@ -305,7 +305,12 @@
             thinkingText.textContent += data.text;
             thinkingText.scrollTop = thinkingText.scrollHeight;
           } else if (event === 'status' && data) {
+            // 工具调用等过程状态也写进“思考过程”框，便于观察 AI 行为
             retryNote.textContent = '（' + data.message + '）';
+            loading.classList.add('hidden');
+            thinking.classList.remove('hidden');
+            thinkingText.textContent += '\n[' + data.message + ']\n';
+            thinkingText.scrollTop = thinkingText.scrollHeight;
           } else if (event === 'result' && data) {
             finished = true;
             render(data.dishes);
